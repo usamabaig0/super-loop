@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+# super-loop: Unified autonomous pipeline combining Grill-Me, GSD Core, and Ralph.
+# Based on: https://github.com/open-gsd/gsd-core & https://github.com/snarktank/ralph
+
+set -e
+
+VERSION="1.0.0"
+DEFAULT_ITERATIONS=15
+TOOL="agy"
+MODEL=""
+
+# Auto-detect AI tool if not installed
+if ! command -v agy &>/dev/null; then
+  if command -v claude &>/dev/null; then
+    TOOL="claude"
+  elif command -v codex &>/dev/null; then
+    TOOL="codex"
+  elif command -v amp &>/dev/null; then
+    TOOL="amp"
+  fi
+fi
+
+show_help() {
+  cat << 'EOF'
+super-loop: Unified autonomous pipeline (Grill-Me + GSD Core + Ralph)
+
+Usage:
+  super-loop "<feature description>"       Initialize and plan a feature through the pipeline
+  super-loop --run [max_iterations]         Execute Ralph autonomous loop on existing prd.json
+  super-loop --status                       Check progress of current run
+  super-loop --verify                       Run verification gates on completed work
+  super-loop -h, --help                     Show this help message
+  super-loop -v, --version                  Show version
+
+Options:
+  --tool <agy|claude|codex|amp>             Specify the AI CLI runner (default: agy)
+  --iterations <N>                          Maximum loop iterations (default: 15)
+
+Pipeline Stages:
+  1. Grill-Me:         Adversarial design stress-testing & scope definition
+  2. GSD Planning:     Phase plan architecture & boundary specification
+  3. Ralph Loop:       Headless fresh-context iterations executing stories in prd.json
+  4. GSD Verification: Quality gates, typechecks, tests, and branch readiness
+EOF
+}
+
+check_dependencies() {
+  if ! command -v jq &>/dev/null; then
+    echo "Error: 'jq' is required by super-loop."
+    exit 1
+  fi
+}
+
+cmd_status() {
+  local prd_file="scripts/ralph/prd.json"
+  [ ! -f "$prd_file" ] && [ -f "prd.json" ] && prd_file="prd.json"
+
+  if [ ! -f "$prd_file" ]; then
+    echo "No prd.json found in ./scripts/ralph or current directory."
+    exit 1
+  fi
+
+  local project
+  local branch
+  project=$(jq -r '.project // "Unknown"' "$prd_file")
+  branch=$(jq -r '.branchName // "main"' "$prd_file")
+  local total
+  local passed
+  total=$(jq '.userStories | length' "$prd_file")
+  passed=$(jq '[.userStories[] | select(.passes == true)] | length' "$prd_file")
+
+  echo "==============================================================="
+  echo "  Super-Loop Status: $project"
+  echo "  Branch: $branch | Completed: $passed / $total stories"
+  echo "==============================================================="
+  echo ""
+  jq -r '.userStories[] | "  [" + (if .passes then "✓" else " " end) + "] " + .id + ": " + .title' "$prd_file"
+  echo ""
+
+  local progress_file="scripts/ralph/progress.txt"
+  [ ! -f "$progress_file" ] && [ -f "progress.txt" ] && progress_file="progress.txt"
+  if [ -f "$progress_file" ]; then
+    echo "Recent Progress Log:"
+    tail -n 12 "$progress_file"
+  fi
+}
+
+cmd_verify() {
+  echo "Running Super-Loop verification gates..."
+  if command -v gsd-tools &>/dev/null; then
+    echo "Running gsd-tools check..."
+    gsd-tools check || true
+  fi
+
+  if [ -f "package.json" ]; then
+    echo "Running project typecheck/test verification..."
+    if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
+      npm run typecheck || true
+    fi
+    if jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+      npm test || true
+    fi
+  fi
+  echo "Verification complete."
+}
+
+cmd_run() {
+  local max_iters="${1:-$DEFAULT_ITERATIONS}"
+  local ralph_script="scripts/ralph/ralph.sh"
+  [ ! -f "$ralph_script" ] && [ -f "ralph.sh" ] && ralph_script="./ralph.sh"
+
+  if [ ! -f "$ralph_script" ]; then
+    echo "Error: ralph.sh not found. Run 'super-loop \"<feature>\"' or 'ralph init' first."
+    exit 1
+  fi
+
+  echo "Starting Ralph headless execution loop ($max_iters iterations, tool: $TOOL)..."
+  if [ "$ralph_script" = "scripts/ralph/ralph.sh" ]; then
+    (cd scripts/ralph && ./ralph.sh --tool "$TOOL" "$max_iters")
+  else
+    "$ralph_script" --tool "$TOOL" ${MODEL:+--model "$MODEL"} "$max_iters"
+  fi
+
+  echo ""
+  echo "Loop finished. Running verification..."
+  cmd_verify
+}
+
+cmd_init() {
+  local feature="$1"
+  check_dependencies
+
+  echo "==============================================================="
+  echo "  Super-Loop: Initializing pipeline for feature"
+  echo "==============================================================="
+  echo "Feature: $feature"
+  echo ""
+
+  # 1. Initialize Ralph directory if needed
+  if [ ! -d "scripts/ralph" ]; then
+    if command -v ralph &>/dev/null; then
+      ralph init scripts/ralph >/dev/null
+    else
+      mkdir -p scripts/ralph
+      if [ -d "/home/ubuntu/.ralph" ]; then
+        cp -r /home/ubuntu/.ralph/* scripts/ralph/ 2>/dev/null || true
+      fi
+    fi
+    echo "✓ Scaffolding created in scripts/ralph/"
+  fi
+
+  # 2. Format a branch name
+  local branch_slug
+  branch_slug=$(echo "$feature" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g' | sed -E 's/^-+|-+$//g' | cut -c 1-30)
+  [ -z "$branch_slug" ] && branch_slug="feature"
+  local branch_name="ralph/$branch_slug"
+
+  # 3. Create initial prd.json if not already customized
+  local prd_file="scripts/ralph/prd.json"
+  if [ ! -f "$prd_file" ] || grep -q "Example Project" "$prd_file" 2>/dev/null; then
+    cat > "$prd_file" << EOF
+{
+  "project": "$feature",
+  "branchName": "$branch_name",
+  "description": "$feature",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Initial architecture & setup for $feature",
+      "description": "As a developer, I want the foundational scaffold and interfaces in place so that the feature can be implemented cleanly.",
+      "acceptanceCriteria": [
+        "Core structures, types, or models created",
+        "Project builds and typechecks without errors"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "Generated by super-loop"
+    },
+    {
+      "id": "US-002",
+      "title": "Core logic and functionality implementation",
+      "description": "As a user, I want the primary business logic implemented according to the feature spec.",
+      "acceptanceCriteria": [
+        "Main functionality works as expected",
+        "Automated unit or integration tests pass"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "Generated by super-loop"
+    },
+    {
+      "id": "US-003",
+      "title": "Verification, error handling & final integration",
+      "description": "As a user, I want resilient error handling and full end-to-end verification.",
+      "acceptanceCriteria": [
+        "Edge cases and error states handled gracefully",
+        "All test suites pass cleanly"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "Generated by super-loop"
+    }
+  ]
+}
+EOF
+    echo "✓ Initialized $prd_file with structured user stories."
+  fi
+
+  echo ""
+  echo "Pipeline Ready!"
+  echo "Next steps:"
+  echo "  1. (Optional) Fine-tune user stories in $prd_file or run '/super-loop' in chat for interactive grilling."
+  echo "  2. Start unattended autonomous execution:"
+  echo "       super-loop --run 15"
+}
+
+# Argument parsing
+check_dependencies
+
+if [ $# -eq 0 ]; then
+  show_help
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      show_help
+      exit 0
+      ;;
+    -v|--version)
+      echo "super-loop v$VERSION"
+      exit 0
+      ;;
+    --status)
+      cmd_status
+      exit 0
+      ;;
+    --verify)
+      cmd_verify
+      exit 0
+      ;;
+    --run)
+      shift
+      cmd_run "${1:-$DEFAULT_ITERATIONS}"
+      exit 0
+      ;;
+    --tool)
+      TOOL="$2"
+      shift 2
+      ;;
+    *)
+      FEATURE_DESC="$1"
+      shift
+      cmd_init "$FEATURE_DESC"
+      exit 0
+      ;;
+  esac
+done

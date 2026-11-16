@@ -1,0 +1,12 @@
+# Temporary files and logs
+*.log
+*.tmp
+.DS_Store
+
+# Ralph runtime artifacts
+scripts/ralph/
+prd.json
+progress.txt
+
+# Planning directories created in target repos
+.planning/
