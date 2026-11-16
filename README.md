@@ -85,7 +85,7 @@ flowchart TD
 Clone the repository and run the installer:
 
 ```bash
-git clone https://github.com/ononymuos/super-loop.git
+git clone https://github.com/usamabaig0/super-loop.git
 cd super-loop
 ./install.sh
 ```
