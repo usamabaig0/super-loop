@@ -1,58 +1,73 @@
 #!/usr/bin/env bash
-# super-loop-advanced: Unified autonomous pipeline combining Grill-Me, GSD Core, Ralph, and Subagent-Driven Development (SDD).
-# Based on: GSD Core, Ralph, and Subagent-Driven Development protocols.
+# super-loop-advanced: Advanced Autonomous Pipeline combining Grill-Me, GSD Core, Ralph, and Subagent-Driven Development (SDD).
+# Enforces strict TDD and 2-stage review gates (Spec Compliance -> Code Quality).
 
-set -e
+set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 DEFAULT_ITERATIONS=15
-TOOL="agy"
-MODEL=""
+TOOL="${AI_TOOL:-}"
+MODEL="${AI_MODEL:-}"
+RALPH_SCAFFOLD="${RALPH_HOME:-$HOME/.ralph}"
 
-# Auto-detect AI tool if not installed
-if ! command -v agy &>/dev/null; then
-  if command -v claude &>/dev/null; then
+# Auto-detect AI tool if not specified
+if [ -z "$TOOL" ]; then
+  if command -v agy &>/dev/null; then
+    TOOL="agy"
+  elif command -v claude &>/dev/null; then
     TOOL="claude"
   elif command -v codex &>/dev/null; then
     TOOL="codex"
+  elif command -v opencode &>/dev/null; then
+    TOOL="opencode"
   elif command -v amp &>/dev/null; then
     TOOL="amp"
+  else
+    TOOL="agy"
   fi
 fi
 
 show_help() {
   cat << 'EOF'
-super-loop-advanced: Unified autonomous pipeline (Grill-Me + GSD Core + Ralph + SDD)
+super-loop-advanced: Autonomous Pipeline (Grill-Me + GSD Core + Ralph + Subagent-Driven Dev)
 
 Usage:
-  super-loop-advanced "<feature description>"       Initialize and plan a feature through the advanced pipeline
-  super-loop-advanced --run [max_iterations]         Execute Ralph + SDD autonomous loop on existing prd.json
-  super-loop-advanced --status                       Check progress of current run and review statuses
-  super-loop-advanced --verify                       Run verification gates on completed work
-  super-loop-advanced -h, --help                     Show this help message
-  super-loop-advanced -v, --version                  Show version
+  super-loop-advanced "<feature description>"       Initialize and plan feature through SDD pipeline
+  super-loop-advanced --run [max_iterations]        Execute autonomous Ralph + SDD loop on prd.json
+  super-loop-advanced --status                      Check progress and 2-stage review states
+  super-loop-advanced --verify                      Run typecheck, lint, and full test suite
+  super-loop-advanced -h, --help                    Show this help message
+  super-loop-advanced -v, --version                 Show version
 
 Options:
-  --tool <agy|claude|codex|amp>             Specify the AI CLI runner (default: agy)
-  --iterations <N>                          Maximum loop iterations (default: 15)
+  --tool <agy|claude|codex|opencode|amp>            Specify the AI CLI runner (default: auto-detected)
+  --model <model_name>                              Model flag passed to AI CLI runner
+  --iterations <N>                                  Maximum loop iterations (default: 15)
 
-Pipeline Stages:
-  1. Grill-Me:         Adversarial design stress-testing, invariants & scope lock
-  2. GSD Planning:     Phase plan architecture, boundary specification & prd.json compilation
-  3. Ralph + SDD Loop: Headless fresh-context iterations with per-story 2-stage review
-                       (TDD Implementer -> Spec Compliance Gate -> Quality/Security Gate)
-  4. GSD Verification: Comprehensive quality gates, typechecks, integration tests, and branch readiness
+Environment Variables:
+  AI_TOOL                                           Default AI CLI tool runner
+  AI_MODEL                                          Default model string
+  RALPH_HOME                                        Custom path to Ralph global template directory (default: ~/.ralph)
+
+Architecture & Quality Protocol:
+  1. Grill-Me:           Challenges assumptions, locks invariants & boundary conditions
+  2. GSD Planning:       Defines architecture, file boundaries, contracts in .planning/
+  3. Subagent TDD:       Fresh context per story; enforces RED -> GREEN -> REFACTOR
+  4. 2-Stage Review:     Gate 1 (Spec Compliance) -> Gate 2 (Code Quality & Security)
+  5. Final Verification: Full build, lint, and automated test suite execution
 EOF
 }
 
 check_dependencies() {
   if ! command -v jq &>/dev/null; then
-    echo "Error: 'jq' is required by super-loop-advanced."
+    echo "Error: 'jq' command-line JSON processor is required by super-loop-advanced."
+    echo "Please install jq (e.g. 'sudo apt install jq' or 'brew install jq')."
     exit 1
   fi
 }
 
 cmd_status() {
+  check_dependencies
   local prd_file="scripts/ralph/prd.json"
   [ ! -f "$prd_file" ] && [ -f "prd.json" ] && prd_file="prd.json"
 
@@ -71,44 +86,114 @@ cmd_status() {
   passed=$(jq '[.userStories[] | select(.passes == true)] | length' "$prd_file")
 
   echo "======================================================================="
-  echo "  Super-Loop Advanced Status (Grill-Me + GSD + Ralph + SDD)"
-  echo "  Project: $project"
-  echo "  Branch:  $branch | Completed: $passed / $total stories"
+  echo "  Super-Loop Advanced Status: $project"
+  echo "  Branch: $branch | Completed: $passed / $total stories"
   echo "======================================================================="
   echo ""
-  jq -r '.userStories[] | "  [" + (if .passes then "✓" else " " end) + "] " + .id + ": " + .title + (if .sddReviewStatus then " (" + .sddReviewStatus + ")" else "" end)' "$prd_file"
+  jq -r '.userStories[] | "  [" + (if .passes then "✓" else " " end) + "] " + .id + ": " + .title + (if .sddReviewStatus then " [" + .sddReviewStatus + "]" else "" end)' "$prd_file"
   echo ""
 
   local progress_file="scripts/ralph/progress.txt"
   [ ! -f "$progress_file" ] && [ -f "progress.txt" ] && progress_file="progress.txt"
   if [ -f "$progress_file" ]; then
     echo "Recent Progress Log:"
-    tail -n 14 "$progress_file"
+    tail -n 15 "$progress_file"
   fi
 }
 
 cmd_verify() {
-  echo "Running Super-Loop Advanced verification gates..."
+  echo "Running Super-Loop Advanced full verification gates..."
+  local status=0
+
   if command -v gsd-tools &>/dev/null; then
-    echo "Running gsd-tools check..."
-    gsd-tools check || true
+    echo "-> GSD health check:"
+    gsd-tools check || status=1
   fi
 
   if [ -f "package.json" ]; then
-    echo "Running project typecheck/test verification..."
-    if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
-      npm run typecheck || true
+    echo "-> Node.js / TypeScript verification:"
+    if command -v jq &>/dev/null && jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
+      npm run typecheck || status=1
     fi
-    if jq -e '.scripts.test' package.json >/dev/null 2>&1; then
-      npm test || true
-    fi
-  elif [ -f "pytest.ini" ] || [ -f "pyproject.toml" ] || [ -d "tests" ]; then
-    if command -v pytest &>/dev/null; then
-      echo "Running pytest suite..."
-      pytest tests/ -q || true
+    if command -v jq &>/dev/null && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+      npm test || status=1
     fi
   fi
-  echo "Verification complete."
+
+  if [ -f "pyproject.toml" ] || [ -f "setup.py" ] || [ -f "pytest.ini" ]; then
+    echo "-> Python verification suite:"
+    if command -v pytest &>/dev/null; then
+      pytest -q || status=1
+    fi
+  fi
+
+  if [ $status -eq 0 ]; then
+    echo "✓ All verification gates passed cleanly."
+  else
+    echo "⚠️ One or more verification gates reported issues."
+  fi
+  return $status
+}
+
+create_fallback_sdd_runner() {
+  local target_dir="scripts/ralph"
+  mkdir -p "$target_dir"
+
+  if [ ! -f "$target_dir/ralph.sh" ]; then
+    cat > "$target_dir/ralph.sh" << 'RUNNER_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOL="${1:-agy}"
+MAX_ITERS="${2:-15}"
+
+if [ "$TOOL" = "--tool" ]; then
+  shift
+  TOOL="${1:-agy}"
+  shift
+  MAX_ITERS="${1:-15}"
+fi
+
+PROMPT_FILE="prompt.md"
+PRD_FILE="prd.json"
+
+[ ! -f "$PROMPT_FILE" ] && echo "Missing $PROMPT_FILE" && exit 1
+[ ! -f "$PRD_FILE" ] && echo "Missing $PRD_FILE" && exit 1
+
+echo "Starting Ralph + SDD orchestrator with $TOOL ($MAX_ITERS iterations)..."
+for i in $(seq 1 "$MAX_ITERS"); do
+  UNPASSED=$(jq '[.userStories[] | select(.passes == false)] | length' "$PRD_FILE")
+  if [ "$UNPASSED" -eq 0 ]; then
+    echo "All user stories passed with two-stage reviews approved!"
+    break
+  fi
+  echo "Ralph iteration $i of $MAX_ITERS..."
+  case "$TOOL" in
+    agy)
+      agy --prompt-file "$PROMPT_FILE" || true
+      ;;
+    claude)
+      claude -p "$(cat "$PROMPT_FILE")" || true
+      ;;
+    codex)
+      codex exec "$(cat "$PROMPT_FILE")" || true
+      ;;
+    opencode)
+      opencode run "$(cat "$PROMPT_FILE")" || true
+      ;;
+    *)
+      if command -v "$TOOL" &>/dev/null; then
+        "$TOOL" "$(cat "$PROMPT_FILE")" || true
+      else
+        echo "Tool $TOOL not found."
+        exit 1
+      fi
+      ;;
+  esac
+done
+RUNNER_EOF
+    chmod +x "$target_dir/ralph.sh"
+  fi
 }
 
 cmd_run() {
@@ -117,11 +202,12 @@ cmd_run() {
   [ ! -f "$ralph_script" ] && [ -f "ralph.sh" ] && ralph_script="./ralph.sh"
 
   if [ ! -f "$ralph_script" ]; then
-    echo "Error: ralph.sh not found. Run 'super-loop-advanced \"<feature>\"' first."
-    exit 1
+    echo "scripts/ralph/ralph.sh not found. Generating default SDD Ralph runner..."
+    create_fallback_sdd_runner
+    ralph_script="scripts/ralph/ralph.sh"
   fi
 
-  echo "Starting Ralph + SDD execution loop ($max_iters iterations, tool: $TOOL)..."
+  echo "Starting Ralph + SDD loop ($max_iters iterations, tool: $TOOL)..."
   if [ "$ralph_script" = "scripts/ralph/ralph.sh" ]; then
     (cd scripts/ralph && ./ralph.sh --tool "$TOOL" "$max_iters")
   else
@@ -129,7 +215,7 @@ cmd_run() {
   fi
 
   echo ""
-  echo "Execution loop completed. Running final GSD verification gates..."
+  echo "Loop completed. Running final verification..."
   cmd_verify
 }
 
@@ -145,8 +231,12 @@ cmd_init() {
 
   # 1. Initialize Ralph directory with SDD scaffold
   mkdir -p scripts/ralph
-  if [ -d "/home/ubuntu/.ralph" ]; then
-    cp -r /home/ubuntu/.ralph/* scripts/ralph/ 2>/dev/null || true
+  if [ -d "$RALPH_SCAFFOLD" ]; then
+    cp -r "$RALPH_SCAFFOLD"/* scripts/ralph/ 2>/dev/null || true
+  elif command -v ralph &>/dev/null; then
+    ralph init scripts/ralph >/dev/null || true
+  else
+    create_fallback_sdd_runner
   fi
 
   # Install specialized SDD prompt for Ralph
@@ -205,12 +295,19 @@ EOF
 
   # 3. Create initial prd.json configured for SDD
   local prd_file="scripts/ralph/prd.json"
-  if [ ! -f "$prd_file" ] || grep -q "Example Project" "$prd_file" 2>/dev/null; then
+  local needs_init=false
+  if [ ! -f "$prd_file" ]; then
+    needs_init=true
+  elif grep -q "Example Project" "$prd_file" 2>/dev/null || grep -q '"project": "MyApp"' "$prd_file" 2>/dev/null || grep -q '"project": ""' "$prd_file" 2>/dev/null; then
+    needs_init=true
+  fi
+
+  if [ "$needs_init" = true ]; then
     cat > "$prd_file" << EOF
 {
-  "project": "$feature",
+  "project": $(jq -n --arg f "$feature" '$f'),
   "branchName": "$branch_name",
-  "description": "$feature",
+  "description": $(jq -n --arg f "$feature" '$f'),
   "sddEnabled": true,
   "userStories": [
     {
@@ -228,11 +325,12 @@ EOF
     },
     {
       "id": "US-002",
-      "title": "Core logic & functionality implementation",
-      "description": "As a user, I want the core business logic implemented according to the feature specification.",
+      "title": "Core logic & TDD implementation for $feature",
+      "description": "As a user, I want the core business logic implemented via TDD with passing unit tests.",
       "acceptanceCriteria": [
-        "Primary business logic implemented and wired to contracts",
-        "Automated unit or integration tests written (TDD) and passing cleanly"
+        "Automated unit tests written and verified passing (TDD RED-GREEN)",
+        "Core domain logic matches functional requirements",
+        "Edge cases and error states covered"
       ],
       "priority": 2,
       "passes": false,
@@ -241,11 +339,12 @@ EOF
     },
     {
       "id": "US-003",
-      "title": "Edge case resilience, security & integration verification",
-      "description": "As a user, I want comprehensive error handling, input validation, and end-to-end verification.",
+      "title": "Integration, UI, and two-stage reviewer signoff for $feature",
+      "description": "As a maintainer, I want end-to-end integration and quality review gates passed.",
       "acceptanceCriteria": [
-        "Edge cases and error states handled gracefully",
-        "All test suites pass cleanly with zero regressions"
+        "E2E integration verified",
+        "Spec compliance review approved",
+        "Code quality and security review approved"
       ],
       "priority": 3,
       "passes": false,
@@ -255,35 +354,85 @@ EOF
   ]
 }
 EOF
-    echo "✓ Initialized $prd_file with structured SDD user stories."
+    echo "✓ Initialized $prd_file with two-stage SDD criteria"
+  else
+    local temp_json
+    temp_json=$(mktemp)
+    jq --arg proj "$feature" --arg b "$branch_name" '.project = $proj | .branchName = $b | .description = $proj | .sddEnabled = true' "$prd_file" > "$temp_json" && mv "$temp_json" "$prd_file"
+    echo "✓ Updated existing $prd_file with project name '$feature'"
+  fi
+
+  # 4. Initialize progress.txt
+  local progress_file="scripts/ralph/progress.txt"
+  if [ ! -f "$progress_file" ]; then
+    cat > "$progress_file" << EOF
+# Ralph + SDD Progress Log
+Project: $feature
+Branch: $branch_name
+Started: $(date '+%Y-%m-%d %H:%M:%S')
+
+## Codebase Patterns
+- Follow project conventions and maintain modular file architecture.
+- Enforce strict RED-GREEN-REFACTOR cycle per story.
+- Every commit must pass both Spec Compliance and Code Quality gates.
+
+## Iteration History
+EOF
+    echo "✓ Created $progress_file"
+  fi
+
+  # 5. Initialize GSD Planning directory structure
+  mkdir -p .planning/phases/01-initial
+  local gsd_plan=".planning/phases/01-initial/PLAN.md"
+  if [ ! -f "$gsd_plan" ]; then
+    cat > "$gsd_plan" << EOF
+# GSD Phase Plan: $feature
+
+## Objective
+Implement $feature through verified autonomous execution using Subagent-Driven Development.
+
+## File Boundaries & Contracts
+- Declarations and interfaces in place prior to implementation
+- Implementer operates in fresh context per story
+
+## Quality Gates
+- Gate 1: Spec Compliance (acceptance criteria, paths, types)
+- Gate 2: Code Quality (style, error handling, security, tests)
+- Full verification: Build, typecheck, lint, automated tests
+EOF
+    echo "✓ Initialized GSD architecture plan in $gsd_plan"
   fi
 
   echo ""
-  echo "Super-Loop Advanced Pipeline Initialized!"
-  echo "Next steps:"
-  echo "  1. (Optional) Fine-tune user stories in $prd_file or run '/super-loop-advanced' in chat."
-  echo "  2. Start unattended autonomous execution:"
+  echo "Advanced SDD Pipeline Ready!"
+  echo "Execution flow:"
+  echo "  1. Review/refine user stories in $prd_file"
+  echo "  2. Launch autonomous execution loop:"
   echo "       super-loop-advanced --run 15"
 }
 
-# Argument parsing
-check_dependencies
+# --- Command Line Interface ---
 
 if [ $# -eq 0 ]; then
   show_help
   exit 0
 fi
 
+# Parse help and version before checking heavy dependencies
+case "$1" in
+  -h|--help)
+    show_help
+    exit 0
+    ;;
+  -v|--version)
+    echo "super-loop-advanced v$VERSION"
+    exit 0
+    ;;
+esac
+
+# Parse options and dispatch commands
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help)
-      show_help
-      exit 0
-      ;;
-    -v|--version)
-      echo "super-loop-advanced v$VERSION"
-      exit 0
-      ;;
     --status)
       cmd_status
       exit 0
@@ -301,10 +450,22 @@ while [[ $# -gt 0 ]]; do
       TOOL="$2"
       shift 2
       ;;
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --iterations)
+      DEFAULT_ITERATIONS="$2"
+      shift 2
+      ;;
+    -*)
+      echo "Unknown option: $1"
+      show_help
+      exit 1
+      ;;
     *)
-      FEATURE_DESC="$1"
-      shift
-      cmd_init "$FEATURE_DESC"
+      # Assume argument is feature prompt
+      cmd_init "$1"
       exit 0
       ;;
   esac
